@@ -1,0 +1,40 @@
+# Ignore Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Ignore virtual environments
+venv*/
+venv*/
+.venv/
+env/
+ENV/
+
+# Ignore temp folders
+temp_input/
+temp_output/
+old_files/
+
+# Ignore system files and IDE settings
+.DS_Store
+*.swp
+*.swo
+.vscode/
+*.log
+
+# Ignore media and executable
+*.exe
+*.mp3
+*.wav
+*.zip
+
+# Ignore environment/config files
+.env
+verify_env.py
+
+# Ignore model files if desired (optional)
+models/
+
+# Ignore large server copies (optional)
+server copy.py
