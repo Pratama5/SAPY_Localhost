@@ -3,8 +3,6 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 
 from dotenv import load_dotenv
 load_dotenv()
-
-
 import requests
 import shutil
 import subprocess
@@ -21,7 +19,6 @@ from supabase import create_client
 from urllib.parse import urlparse
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 # DL Libraries
 import h5py
 import numpy as np
@@ -33,6 +30,16 @@ import librosa
 import scipy.io
 import matplotlib.pyplot as plt
 
+# Queue System
+from queue import Queue
+from threading import Thread
+import uuid
+
+# To Start the server, run:
+# python -m uvicorn server:app --host 0.0.0.0 --port 8000
+# To Reload:
+# uvicorn server:app --reload
+
 
 # Supabase credentials from environment variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -40,11 +47,9 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Testing the connection
-# print("🔍 SUPABASE_URL =", os.getenv("SUPABASE_URL"))
-# print("🔐 SUPABASE_SERVICE_ROLE_KEY =", os.getenv("SUPABASE_SERVICE_ROLE_KEY")[:5] + '...')  # Hide most of the key
+
 PN_CODE_LENGTH = 1000
-# --- THE ATTACK LIST  ---
+
 ATTACK_LIST = [
     ([0, 0], 'Clean'), # Class 0
     ([1, 3000], 'LPF3k'), ([1, 6000], 'LPF6k'), ([1, 9000], 'LPF9k'),
@@ -64,34 +69,81 @@ ATTACK_LIST = [
 NUM_ATTACK_CLASSES = len(ATTACK_LIST)
 id_to_attack_name = {i: attack[1] for i, attack in enumerate(ATTACK_LIST)}
 
+DL_ATTACK_ID_TO_NAME = {
+    0: 'AdditiveWhite',
+    1: 'BPF',
+    2: 'Clean',
+    3: 'Echo',
+    4: 'Equalizer',
+    5: 'LPF',
+    6: 'LinearSpeed',
+    7: 'MP3',
+    8: 'PitchShift',
+    9: 'Requantization',
+    10: 'Resampling',
+    11: 'TimeScale'
+}
+
 DL_MODEL = None
-# MODEL_PATH = "models/MultiTaskExtractor_v111_BEST.h5" # Use server_21Layer.py for this model
-# MODEL_PATH = "models/MultiTaskExtractor_v15_BEST.h5" # Use server_21Layer.py for this model
-# MODEL_PATH = "models/MultiTaskExtractor_v11_BEST.h5"
+ATTACK_CLASSIFIER_MODEL = None 
+
 MODEL_PATH = "models/MultiTaskExtractor_v15_Copy.keras"
-# MODEL_PATH = "models/MultiTaskExtractor_v11_BEST_Final.keras"
+# MODEL_PATH = "models/1200.keras"
+ATTACK_MODEL_PATH = "models/AttackClassifier_v32.keras" 
+
+
+
+task_queue = Queue()
+active_task_id = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global DL_MODEL
+    global DL_MODEL, ATTACK_CLASSIFIER_MODEL 
     print("🚀 Server starting up...")
 
     try:
+        
         if os.path.exists(MODEL_PATH):
-            print(f"🔍 Loading full model from: {os.path.abspath(MODEL_PATH)}")
-            
-            # ✅ Load full model directly (architecture + weights + config)
+            print(f"🔍 Loading watermark extraction model from: {os.path.abspath(MODEL_PATH)}")
             DL_MODEL = keras.models.load_model(MODEL_PATH)
-            
-            print("✅ DL model loaded successfully with `load_model()`.")
-            # DL_MODEL.summary()
+            print("✅ Watermark model loaded successfully.")
         else:
-            print(f"⚠️ ERROR: Model file not found at {MODEL_PATH}")
-    except Exception as e:
-        print(f"🔥 FAILED to load DL model: {e}")
-        DL_MODEL = None  # Fallback to avoid server crash
+            print(f"⚠️ ERROR: Watermark model file not found at {MODEL_PATH}")
 
+        
+        if os.path.exists(ATTACK_MODEL_PATH):
+            ATTACK_CLASSIFIER_MODEL = keras.models.load_model(ATTACK_MODEL_PATH)
+            print("✅ Ready to Rock!")
+        else:
+            print(f"⚠️ ERROR: Attack model file not found at {ATTACK_MODEL_PATH}")
+
+    except Exception as e:
+        print(f"🔥 FAILED to load DL models: {e}")
+        DL_MODEL = None  
+        ATTACK_CLASSIFIER_MODEL = None # Fallback to avoid server crash
+
+    def task_worker():
+        global active_task_id
+        while True:
+            task_id, task_func, callback = task_queue.get()
+            active_task_id = task_id
+            try:
+                result = task_func()
+                callback(success=True, result=result)
+            except Exception as e:
+                print(f"🔥🔥🔥 UNEXPECTED WORKER ERROR for task {task_id}: {e}")
+                error_payload = {
+                    "status": "error",
+                    "message": f"An unexpected error occurred in the task worker: {str(e)}"
+                }
+                callback(success=False, result=error_payload)
+            active_task_id = None
+            task_queue.task_done()
+
+    # Start background task processing thread
+    Thread(target=task_worker, daemon=True).start()
+   
     yield
     print("🛑 Server shutting down...")
 
@@ -136,158 +188,185 @@ class AttackRequest(BaseModel):
     uploaded_by: str  # user UUID
 
 
-
-def resolve_unique_filename(bucket, folder, base_filename):
-    name, ext = os.path.splitext(base_filename)
-    attempt = 1
-    candidate = base_filename
-
-    while True:
-        existing = supabase.storage.from_(bucket).list(path=folder)
-        filenames = [item['name'] for item in existing if 'name' in item]
-
-        if candidate not in filenames:
-            return candidate  # unique filename found
-
-        attempt += 1
-        candidate = f"{name} ({attempt}){ext}"
-
-def clear_temp_folders():
-     for folder in ["temp_input", "temp_output"]:
-        # DIAGNOSTIC: Announce which folder is being cleared
-        print(f"--- [DIAGNOSTIC] Clearing temp folder: ./{folder} ---")
-        files = glob.glob(f"{folder}/*")
-        if not files:
-            print(f"--- [DIAGNOSTIC] Folder is already empty. ---")
-            continue
-            
-        for file in files:
-            try:
-                # DIAGNOSTIC: Announce which file is being deleted
-                print(f"--- [DIAGNOSTIC] Deleting old file: {file} ---")
-                os.remove(file)
-            except Exception as e:
-                print(f"⚠️ Failed to delete {file}: {e}")
-
-def get_attack_name(attack_type: int, attack_param: int) -> str:
-    # """Finds the human-readable attack name from the global ATTACK_LIST."""
-    for attack_info in ATTACK_LIST:
-        if attack_info[0] == [attack_type, attack_param]:
-            return attack_info[1]
-    return "Custom Attack" # Fallback name if not found in the list
-
-# --- perform_dl_extraction function MODIFICATIONS ---
-# In server.py, replace the existing perform_dl_extraction function with this one.
-
-def perform_dl_extraction(audio_path: str, key_path: str, output_dir: str):
-    if DL_MODEL is None:
-        raise RuntimeError("DL Model is not loaded. Cannot perform extraction.")
-
-    print(f"🕵️‍♂️ Processing audio='{os.path.basename(audio_path)}', key='{os.path.basename(key_path)}'")
-
-    if not os.path.exists(key_path):
-        raise FileNotFoundError(f"Key file not found at: {key_path}")
-    
-    mat_contents = scipy.io.loadmat(key_path)
-    true_watermark_flat = mat_contents.get('wt_all')[0, 0].flatten().astype(int)
-    
-    PN_CODE_LENGTH = 1000
-    STFT_DIMS = (1025, 256)
-    WATERMARK_OUTPUT_DIMS = (32, 32)
-    
-    y, sr = librosa.load(audio_path, sr=None)
-    
-    M = int(mat_contents['M'][0][0])
-    N = int(mat_contents['N'][0][0])
-    B = int(mat_contents['B'][0][0])
-    block_len = M * N * (B**2)
-    all_block_nums = mat_contents['saved_original_indices'].flatten().astype(int)
-
-    best_ber = float('inf')
-    best_predicted_image = None
-    best_predicted_attack = "N/A"
-    best_block_num = -1
-
-    print(f"🔬 Found {len(all_block_nums)} blocks. Starting evaluation...")
-
-    for block_num in all_block_nums:
-        start, end = (block_num - 1) * block_len, block_num * block_len
-        audio_block = y[start:end]
-
-        if audio_block.size == 0:
-            print(f"  - WARNING: Block {block_num} is empty. Skipping.")
-            continue
-        
-        stft_result = librosa.stft(audio_block)
-        magnitude = np.abs(stft_result)
-        phase = np.angle(stft_result)
-        two_channel_stft = np.stack([magnitude / (np.max(magnitude) + 1e-6), phase], axis=-1)
-        
-        time_steps = STFT_DIMS[1]
-        if two_channel_stft.shape[1] < time_steps:
-            pad_width = time_steps - two_channel_stft.shape[1]
-            two_channel_stft = np.pad(two_channel_stft, ((0, 0), (0, pad_width), (0, 0)))
-        else:
-            two_channel_stft = two_channel_stft[:, :time_steps, :]
-        
-        pn0 = mat_contents['pn0_all'][0, 0].flatten()
-        pn1 = mat_contents['pn1_all'][0, 0].flatten()
-        
-        pn0 = np.pad(pn0, (0, PN_CODE_LENGTH - len(pn0))) if len(pn0) < PN_CODE_LENGTH else pn0[:PN_CODE_LENGTH]
-        pn1 = np.pad(pn1, (0, PN_CODE_LENGTH - len(pn1))) if len(pn1) < PN_CODE_LENGTH else pn1[:PN_CODE_LENGTH]
-        
-        input_stft = np.expand_dims(two_channel_stft, axis=0)
-        input_pn0 = np.expand_dims(pn0, axis=0)
-        input_pn1 = np.expand_dims(pn1, axis=0)
-        
-        predicted_watermark_output, predicted_attack_probs = DL_MODEL.predict([input_stft, input_pn0, input_pn1], verbose=0)
-        
-        predicted_image = predicted_watermark_output[0].squeeze()
-        predicted_binary_flat = (predicted_image.flatten() > 0.5).astype(int)
-        
-        ber = np.not_equal(predicted_binary_flat, true_watermark_flat).sum() / true_watermark_flat.size
-        
-        if ber < best_ber:
-            best_ber = ber
-            raw_image = (predicted_binary_flat.reshape(WATERMARK_OUTPUT_DIMS) * 255).astype(np.uint8)
-            rotated_image = np.rot90(raw_image, k=-1)
-            corrected_image = np.fliplr(rotated_image)
-            best_predicted_image = corrected_image
-            
-            pred_attack_id = np.argmax(predicted_attack_probs[0])
-            best_predicted_attack = id_to_attack_name.get(pred_attack_id, "Unknown Attack")
-            best_block_num = block_num
-
-    if best_predicted_image is None:
-        raise ValueError("Could not process any audio blocks to generate a watermark image.")
-
-    print(f"🏆 Selected Block {best_block_num} as the best result with BER: {best_ber:.4f}")
-    
-    output_img_filename = os.path.basename(audio_path).replace(".wav", "_extracted_dl.png")
-    output_img_path = os.path.join(output_dir, output_img_filename)
-    
-    # The 'best_predicted_image' being saved here is now the corrected version
-    plt.imsave(output_img_path, best_predicted_image, cmap='gray')
-    
-    return output_img_path, best_ber, best_predicted_attack
 #-------------------------------------------------------- Ping Check -------------------------------------------------------
 @app.get("/ping")
 async def ping_server():
-    # A simple endpoint to check if the server is alive and responding.
-    # Get current time in Jakarta for the log message
-    jakarta_time = datetime.now(ZoneInfo("Asia/Jakarta"))
-    log_timestamp = jakarta_time.strftime("%Y-%m-%d %H:%M:%S") # Format for readability
 
-    # Print a message to the server's console
+    jakarta_time = datetime.now(ZoneInfo("Asia/Jakarta"))
+    log_timestamp = jakarta_time.strftime("%Y-%m-%d %H:%M:%S") 
+
+   
     print(f"[{log_timestamp} Asia/Jakarta] Ping request received. Responding with 'pong'.")
     
     return {"status": "ok", "message": "pong"}
+
+#------------------------------------------------------- Queue Status -------------------------------------------------------
+@app.get("/queue_status/{task_id}")
+async def queue_status(task_id: str):
+    if task_id == active_task_id:
+        return {
+            "status": "processing",
+            "position": 0
+        }
+
+
+    queue_snapshot = list(task_queue.queue)  
+    task_ids = [entry[0] for entry in queue_snapshot]
+
+    if task_id in task_ids:
+        return {
+            "status": "queued",
+            "position": task_ids.index(task_id) + 1  # position in line (1-based)
+        }
+
+    return {
+        "status": "done or unknown",
+        "message": "Task has either finished or never existed."
+    }
+
 #`------------------------------------------------------- Embed Watermark -------------------------------------------------------`
 @app.post("/embed")
 async def embed_watermark(data: EmbedRequest, authorization: str | None = Header(default=None)):
-    start_time = time.time()
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"status": "error", "message": "Unauthorized: Missing or invalid token"}
+    
+    access_token = authorization.split(" ")[1]
+    task_id = str(uuid.uuid4())
+    result_holder = {}
 
-    clear_temp_folders()  # Clear temp folders before processing
+    def run_embed_task():
+        print(f"[QUEUE] Running embed task {task_id}")
+        return process_embed_task(data, access_token)
+
+
+    def callback(success, result):
+        task_results[task_id] = result  # ✅ Save final result
+
+    task_queue.put((task_id, run_embed_task, callback))
+
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "position": task_queue.qsize(),  # 1-based index
+        "message": "Task added to queue. Use /queue_status/{task_id} to check status.",
+        "watermarked_filename": os.path.basename(data.audio_url).replace(".wav", "") + "-" + datetime.now().strftime("%y%m%d_%H%M") + ".wav"
+    }
+
+# ------------------------------------------------------- Attack Audio -----------------------------------------------------------
+@app.post("/attack")
+async def apply_attack(data: AttackRequest, authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return {"status": "error", "message": "Unauthorized: Missing or invalid token"}
+    
+    access_token = authorization.split(" ")[1]
+    task_id = str(uuid.uuid4())
+    result_holder = {}
+
+    def run_attack_task():
+        print(f"[QUEUE] Running attack task {task_id}")
+        return process_attack_task(data, access_token)
+
+    # def callback(success, result):
+    #     result_holder["status"] = "success" if success else "error"
+    #     result_holder["result"] = result
+    def callback(success, result):
+        task_results[task_id] = result  # ✅ Save final result
+
+    task_queue.put((task_id, run_attack_task, callback))
+
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "position": task_queue.qsize(),
+        "message": "Task added to queue. Use /queue_status/{task_id} to check status."
+    }
+
+# ------------------------------------------------------- Extract Watermark -------------------------------------------------------
+@app.post("/extract")
+async def extract_watermark(data: ExtractRequest):
+    task_id = str(uuid.uuid4())
+    result_holder = {}
+
+    def run_extract_task():
+        print(f"[QUEUE] Running extract task {task_id}")
+        return process_extract_task(data)
+
+    # def callback(success, result):
+    #     result_holder["status"] = "success" if success else "error"
+    #     result_holder["result"] = result
+    def callback(success, result):
+        task_results[task_id] = result  # ✅ Save final result
+
+    task_queue.put((task_id, run_extract_task, callback))
+
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "position": task_queue.qsize(),
+        "message": "Task added to queue. Use /queue_status/{task_id} to check status."
+    }
+
+# ------------------------------------------------------- Extract DL Watermark -------------------------------------------------------
+@app.post("/extract-dl")
+async def extract_watermark_dl(data: ExtractDLRequest):
+    task_id = str(uuid.uuid4())
+    result_holder = {}
+
+    def run_extract_dl_task():
+        print(f"[QUEUE] Running extract-dl task {task_id}")
+        return process_extract_dl_task(data)
+
+    # def callback(success, result):
+    #     result_holder["status"] = "success" if success else "error"
+    #     result_holder["result"] = result
+    def callback(success, result):
+        task_results[task_id] = result  # ✅ Save final result
+
+
+    task_queue.put((task_id, run_extract_dl_task, callback))
+
+    return {
+        "status": "queued",
+        "task_id": task_id,
+        "position": task_queue.qsize(),
+        "message": "Task added to queue. Use /queue_status/{task_id} to check status."
+    }
+
+# # ------------------------------------------------------- Get Watermarked Metadata -------------------------------------------------------
+# @app.get("/meta/watermarked/{filename}")
+# async def get_watermarked_metadata(filename: str):
+#     print(f"🔎 Looking up metadata for: {filename}")
+#     result = supabase.table("audio_watermarked").select("*").eq("filename", filename).execute()
+#     if not result.data:
+#         print("❌ Metadata not found")
+#         return {"status": "error", "message": "Not found"}
+#     print("✅ Metadata found:", result.data[0])
+#     return result.data[0]
+
+# ------------------------------------------------------- Get Extracted Metadata -------------------------------------------------------
+# Global dictionary to store finished results
+task_results = {}
+
+@app.get("/result/{task_id}")
+async def get_task_result(task_id: str):
+    if task_id in task_results:
+        return task_results[task_id]
+    return JSONResponse(status_code=404, content={"status": "error", "message": "Result not found"})
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Embedd Start ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def process_embed_task(data: EmbedRequest, access_token: str):
+
+    print(f"[QUEUE] Embedding task started for user: {data.uploaded_by}")
+
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    user_supabase.auth.session = {
+        "access_token": access_token,
+        "refresh_token": access_token
+    }
+
+    start_time = time.time()
+    clear_temp_folders()
     jakarta_time = datetime.now(ZoneInfo("Asia/Jakarta"))
 
     # Formatter for database timestamp (YYYY-MM-DD HH:MM:SS+ZZ:ZZ)
@@ -300,18 +379,6 @@ async def embed_watermark(data: EmbedRequest, authorization: str | None = Header
     formatted_time = jakarta_time.strftime("%Y-%m-%d %H:%M:%S%z")
     formatted_time = formatted_time[:-2] + ':' + formatted_time[-2:]
 
-    # ------------------- USER IMPERSONATION LOGIC -------------------
-    if not authorization or not authorization.startswith("Bearer "):
-        return {"status": "error", "message": "Unauthorized: Missing or invalid token"}
-    
-    access_token = authorization.split(" ")[1]
-
-    # Create a new client authenticated AS THE USER
-    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    user_supabase.auth.set_session(access_token=access_token, refresh_token=access_token)
-    # ------------------- END OF LOGIC -------------------
-
- 
     print("Jakarta time:", formatted_time)
     print("Received request Embedding from:", data.uploaded_by)
 
@@ -386,20 +453,41 @@ async def embed_watermark(data: EmbedRequest, authorization: str | None = Header
         info = sf.info(output_audio_path)
         print(f"📤 Uploading file with sample rate: {info.samplerate}, frames: {info.frames}")
 
-        # Upload to Supabase
-        with open(output_audio_path, 'rb') as f:
-            user_supabase.storage.from_('watermarked').upload(
-                f"audios/{unique_output_audio_filename}",
-                f,
-                {"content-type": "audio/wav"}
-            )
-        with open(output_key_path, 'rb') as f:
-            user_supabase.storage.from_('watermarked').upload(
-                f"key/{os.path.basename(output_key_path)}",
-                f,
-                {"content-type": "application/octet-stream"}
-            )
-         # Get the full human-readable method name for database storage
+        try:
+            with open(output_audio_path, 'rb') as f:
+                supabase.storage.from_('watermarked').upload(
+                    f"audios/{unique_output_audio_filename}",
+                    f,
+                    {"content-type": "audio/wav"}
+                )
+            print("✅ Audio uploaded to Supabase successfully.")
+
+            with open(output_key_path, 'rb') as f:
+                supabase.storage.from_('watermarked').upload(
+                    f"key/{os.path.basename(output_key_path)}",
+                    f,
+                    {"content-type": "application/octet-stream"}
+                )
+            print("✅ Key uploaded to Supabase successfully.")
+
+        except Exception as e:
+            print(f"❌ Failed during Supabase upload: {e}")
+            raise
+
+        # # Upload to Supabase
+        # with open(output_audio_path, 'rb') as f:
+        #     user_supabase.storage.from_('watermarked').upload(
+        #         f"audios/{unique_output_audio_filename}",
+        #         f,
+        #         {"content-type": "audio/wav"}
+        #     )
+        # with open(output_key_path, 'rb') as f:
+        #     user_supabase.storage.from_('watermarked').upload(
+        #         f"key/{os.path.basename(output_key_path)}",
+        #         f,
+        #         {"content-type": "application/octet-stream"}
+        #     )
+        #  # Get the full human-readable method name for database storage
         friendly_method_name = METHOD_NAME_MAP.get(data.method_identifier, "Unknown Method")
 
 
@@ -455,24 +543,23 @@ async def embed_watermark(data: EmbedRequest, authorization: str | None = Header
         duration = end_time - start_time
         print(f"⏱️ Embed process FAILED after {duration:.2f} seconds.")
         return {"status": "error", "message": f"Unexpected server error: {str(e)}"}
-    
-# ------------------------------------------------------- Attack Audio -----------------------------------------------------------
-# IN server.py, REPLACE THE ENTIRE /attack FUNCTION WITH THIS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Embedd End ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~    
 
-@app.post("/attack")
-async def apply_attack(data: AttackRequest, authorization: str | None = Header(default=None)):
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Attack Start ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def process_attack_task(data: AttackRequest, access_token: str):
+
+    print(f"[QUEUE] Starting attack task for {data.original_filename}")
+
+    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    user_supabase.auth.session = {
+        "access_token": access_token,
+        "refresh_token": access_token
+    }
     start_time = time.time()
     clear_temp_folders()
     jakarta_time = datetime.now(ZoneInfo("Asia/Jakarta"))
     db_formatted_time = jakarta_time.strftime("%Y-%m-%d %H:%M:%S%z")
     db_formatted_time = db_formatted_time[:-2] + ':' + db_formatted_time[-2:]
-
-    # --- USER AUTHENTICATION ---
-    if not authorization or not authorization.startswith("Bearer "):
-        return {"status": "error", "message": "Unauthorized: Missing or invalid token"}
-    access_token = authorization.split(" ")[1]
-    user_supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    user_supabase.auth.set_session(access_token=access_token, refresh_token=access_token)
     
     print(f"Received request to ATTACK file: {data.original_filename}")
     print(f"Attack Type: {data.attack_type}, Param: {data.attack_param}")
@@ -549,11 +636,11 @@ async def apply_attack(data: AttackRequest, authorization: str | None = Header(d
             return {"status": "error", "message": "Attacked output files were not generated by the executable."}
 
         with open(output_audio_path, 'rb') as f:
-            user_supabase.storage.from_('watermarked').upload(
+            supabase.storage.from_('watermarked').upload(
                 f"audios/{attacked_audio_filename}", f, {"content-type": "audio/wav"}
             )
         with open(output_key_path, 'rb') as f:
-            user_supabase.storage.from_('watermarked').upload(
+            supabase.storage.from_('watermarked').upload(
                 f"key/{attacked_key_filename}", f, {"content-type": "application/octet-stream"}
             )
 
@@ -593,10 +680,13 @@ async def apply_attack(data: AttackRequest, authorization: str | None = Header(d
     except Exception as e:
         print(f"🔥 An error occurred during attack process: {e}")
         return {"status": "error", "message": f"An unexpected server error occurred: {str(e)}"}
-    
-# ------------------------------------------------------- Extract Watermark -------------------------------------------------------
-@app.post("/extract")
-async def extract_watermark(data: ExtractRequest):
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Attack End ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Extract Start ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def process_extract_task(data: ExtractRequest):
+
+    print(f"[QUEUE] Extract task started for audio: {data.filename}")
+
     start_time = time.time()
 
     clear_temp_folders()
@@ -674,7 +764,7 @@ async def extract_watermark(data: ExtractRequest):
 
     # ✅ Extract BER (robust pattern match)
     ber_value = None
-    ber_match = re.search(r'BER\s*=\s*([0-9.]+)', stdout_text)
+    ber_match = re.search(r'Best watermark found .* with BER = ([0-9.]+)', stdout_text)
     if ber_match:
         try:
             ber_value = float(ber_match.group(1))
@@ -702,10 +792,11 @@ async def extract_watermark(data: ExtractRequest):
         "watermark_url": watermark_url,
         "ber": ber_value
     }
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Extract End ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-# ------------------------------------------------------- Extract DL Watermark -------------------------------------------------------
-@app.post("/extract-dl")
-async def extract_watermark_dl(data: ExtractDLRequest):
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Extract-DL Start ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+def process_extract_dl_task(data: ExtractDLRequest):
+    print(f"[QUEUE] DL Extraction task started for audio: {data.filename}")
     start_time = time.time()
     
     clear_temp_folders()
@@ -716,44 +807,61 @@ async def extract_watermark_dl(data: ExtractDLRequest):
     os.makedirs(temp_input_dir, exist_ok=True)
     os.makedirs(temp_output_dir, exist_ok=True)
 
-    audio_filename = data.filename
-    input_audio_path = os.path.join(temp_input_dir, audio_filename)
-    key_filename = audio_filename.replace(".wav", "_data.mat")
+    # 1. DERIVE ORIGINAL FILENAME
+    original_audio_filename = get_original_filename_from_watermarked(data.filename)
+    if not original_audio_filename:
+        return {"status": "error", "message": f"Could not parse original filename from '{data.filename}'."}
+    
+    print(f"--- [DIAGNOSTIC] Derived original host audio name: {original_audio_filename} ---")
+
+    # Define paths for all files
+    watermarked_audio_filename = data.filename
+    input_watermarked_audio_path = os.path.join(temp_input_dir, watermarked_audio_filename)
+    input_original_audio_path = os.path.join(temp_input_dir, original_audio_filename)
+    key_filename = watermarked_audio_filename.replace(".wav", "_data.mat")
     input_key_path = os.path.join(temp_input_dir, key_filename)
 
-    print(f"--- [DIAGNOSTIC] Input audio path set to: {input_audio_path} ---")
-    print(f"--- [DIAGNOSTIC] Input key path set to:   {input_key_path} ---")
-
-    rows = supabase.table("audio_watermarked").select("key_url").eq("filename", data.filename).execute()
-    if not rows.data:
-        return {"status": "error", "message": f"Key not found for audio file: {data.filename}"}
-    key_url = rows.data[0]["key_url"]
-
     try:
-        # Download the audio file
-        audio_resp = requests.get(data.audio_url)
-        audio_resp.raise_for_status()
-        with open(input_audio_path, 'wb') as f:
-            f.write(audio_resp.content)
-        audio_size = os.path.getsize(input_audio_path)
-        print(f"--- [DIAGNOSTIC] DOWNLOADED audio '{audio_filename}' | Size: {audio_size} bytes ---")
+        # 2. FETCH URLS FOR ALL REQUIRED FILES
+        # Get Key URL (from watermarked audio record)
+        key_rows = supabase.table("audio_watermarked").select("key_url").eq("filename", data.filename).execute()
+        if not key_rows.data:
+            return {"status": "error", "message": f"Key not found for audio file: {data.filename}"}
+        key_url = key_rows.data[0]["key_url"]
 
-        # Download the key file
-        key_resp = requests.get(key_url)
-        key_resp.raise_for_status()
+        # Get Original Audio URL (from audio_files table)
+        original_audio_rows = supabase.table("audio_files").select("url").eq("filename", original_audio_filename).execute()
+        if not original_audio_rows.data:
+            return {"status": "error", "message": f"Original audio '{original_audio_filename}' not found in 'audio_files' table."}
+        original_audio_url = original_audio_rows.data[0]["url"]
+
+        # 3. DOWNLOAD ALL FILES
+        print("--- [DIAGNOSTIC] Downloading 3 files... ---")
+        requests.get(data.audio_url, stream=True).raise_for_status()
+        with open(input_watermarked_audio_path, 'wb') as f:
+            for chunk in requests.get(data.audio_url, stream=True).iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        requests.get(original_audio_url, stream=True).raise_for_status()
+        with open(input_original_audio_path, 'wb') as f:
+            for chunk in requests.get(original_audio_url, stream=True).iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        requests.get(key_url, stream=True).raise_for_status()
         with open(input_key_path, 'wb') as f:
-            f.write(key_resp.content)
-        key_size = os.path.getsize(input_key_path)
-        print(f"--- [DIAGNOSTIC] DOWNLOADED key '{key_filename}' | Size: {key_size} bytes ---")
+            for chunk in requests.get(key_url, stream=True).iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("--- [DIAGNOSTIC] All files downloaded successfully. ---")
 
-        # Call the corrected extraction function
+        # 4. CALL EXTRACTION WITH BOTH AUDIO PATHS
         extracted_img_path, ber_value, predicted_attack = perform_dl_extraction(
-            audio_path=input_audio_path,
+            watermarked_audio_path=input_watermarked_audio_path,
+            original_audio_path=input_original_audio_path,
             key_path=input_key_path,
             output_dir=temp_output_dir
         )
         
-        print(f"🧠 DL Model Predicted Attack: {predicted_attack}")
+        print(f"🧠 Specialized Model Predicted Attack: {predicted_attack}")
         
         if not os.path.exists(extracted_img_path):
             return {"status": "error", "message": "DL extraction failed to produce an image file."}
@@ -776,25 +884,211 @@ async def extract_watermark_dl(data: ExtractDLRequest):
             "source_audio": data.filename,
             "ber": ber_value, 
             "uploaded_at": timestamp, 
-            "uploaded_by": data.uploaded_by
+            "uploaded_by": data.uploaded_by,
+            # "predicted_attack": predicted_attack # Optional: Save prediction to DB
         }).execute()
 
         end_time = time.time()
-        # FIX: Calculate duration before using it.
         duration = end_time - start_time
         print(f"⏱️ DL Extraction process completed in {duration:.2f} seconds.")
 
         return {
             "status": "success", 
             "watermark_url": watermark_url, 
-            "ber": ber_value
+            "ber": ber_value,
+            "predicted_attack": predicted_attack
         }
 
     except Exception as e:
         end_time = time.time()
-        # FIX: Calculate duration before using it in the error log.
         duration = end_time - start_time
         print(f"⏱️ DL Extraction process FAILED after {duration:.2f} seconds.")
-        
         print(f"🔥 An error occurred during DL extraction: {e}")
         return {"status": "error", "message": f"An unexpected server error occurred: {str(e)}"}
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Process Extract-DL End ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+# ------------------------------------------------------- Utility Functions -------------------------------------------------------
+
+def resolve_unique_filename(bucket, folder, base_filename):
+    name, ext = os.path.splitext(base_filename)
+    attempt = 1
+    candidate = base_filename
+
+    while True:
+        existing = supabase.storage.from_(bucket).list(path=folder)
+        filenames = [item['name'] for item in existing if 'name' in item]
+
+        if candidate not in filenames:
+            return candidate  # unique filename found
+
+        attempt += 1
+        candidate = f"{name} ({attempt}){ext}"
+
+def clear_temp_folders():
+     for folder in ["temp_input", "temp_output"]:
+        # DIAGNOSTIC: Announce which folder is being cleared
+        print(f"--- [DIAGNOSTIC] Clearing temp folder: ./{folder} ---")
+        files = glob.glob(f"{folder}/*")
+        if not files:
+            print(f"--- [DIAGNOSTIC] Folder is already empty. ---")
+            continue
+            
+        for file in files:
+            try:
+                # DIAGNOSTIC: Announce which file is being deleted
+                print(f"--- [DIAGNOSTIC] Deleting old file: {file} ---")
+                os.remove(file)
+            except Exception as e:
+                print(f"⚠️ Failed to delete {file}: {e}")
+
+def get_attack_name(attack_type: int, attack_param: int) -> str:
+    # """Finds the human-readable attack name from the global ATTACK_LIST."""
+    for attack_info in ATTACK_LIST:
+        if attack_info[0] == [attack_type, attack_param]:
+            return attack_info[1]
+    return "Custom Attack" # Fallback name if not found in the list
+
+def get_original_filename_from_watermarked(watermarked_filename: str) -> str:
+    """
+    Parses a watermarked or attacked filename to find the original host filename.
+    Example: 'audioHostName-250722_1030.wav' -> 'audioHostName.wav'
+    Example: 'audioHostName-250722_1030_att.wav' -> 'audioHostName.wav'
+    """
+    # This regex looks for the timestamp pattern '-yymmdd_hhmm' and splits the string there.
+    match = re.split(r'-\d{6}_\d{4}', watermarked_filename)
+    if match and match[0]:
+        return f"{match[0]}.wav"
+    return None # Return None if parsing fails
+
+def perform_dl_extraction(watermarked_audio_path: str, original_audio_path: str, key_path: str, output_dir: str):
+    if DL_MODEL is None or ATTACK_CLASSIFIER_MODEL is None:
+        raise RuntimeError("One or more DL Models are not loaded. Cannot perform extraction.")
+
+    # 1. LOAD DATA
+    print(f"🕵️‍♂️ Processing watermarked='{os.path.basename(watermarked_audio_path)}', original='{os.path.basename(original_audio_path)}'")
+    y_watermarked, sr = librosa.load(watermarked_audio_path, sr=None)
+    y_original, _ = librosa.load(original_audio_path, sr=sr) # Ensure same sample rate
+
+    if not os.path.exists(key_path):
+        raise FileNotFoundError(f"Key file not found at: {key_path}")
+    
+    mat_contents = scipy.io.loadmat(key_path)
+    true_watermark_flat = mat_contents.get('wt_all')[0, 0].flatten().astype(int)
+    
+    # Constants from key file or globals
+    PN_CODE_LENGTH = 1000
+    STFT_DIMS = (1025, 256)
+    WATERMARK_OUTPUT_DIMS = (32, 32)
+
+    # Constants for the Attack Classifier Model (from your notebook)
+    N_MFCC_ATTACK = 20
+    MAX_PAD_LEN_ATTACK = 256
+    
+    M, N, B = int(mat_contents['M'][0][0]), int(mat_contents['N'][0][0]), int(mat_contents['B'][0][0])
+    block_len = M * N * (B**2)
+    all_block_nums = mat_contents['saved_original_indices'].flatten().astype(int)
+
+    best_ber = float('inf')
+    best_predicted_image = None
+    best_predicted_attack = "N/A"
+    best_block_num = -1
+
+    print(f"🔬 Found {len(all_block_nums)} blocks. Starting evaluation...")
+
+    for block_num in all_block_nums:
+        start, end = (block_num - 1) * block_len, block_num * block_len
+        
+        # --- PREPARE INPUTS FOR WATERMARK EXTRACTOR (Model 1) ---
+        audio_block_w = y_watermarked[start:end]
+        if audio_block_w.size == 0:
+            print(f"  - WARNING: Watermarked Block {block_num} is empty. Skipping.")
+            continue
+        
+        stft_result = librosa.stft(audio_block_w)
+        magnitude = np.abs(stft_result)
+        phase = np.angle(stft_result)
+        two_channel_stft = np.stack([magnitude / (np.max(magnitude) + 1e-6), phase], axis=-1)
+        
+        time_steps = STFT_DIMS[1]
+        if two_channel_stft.shape[1] < time_steps:
+            pad_width = time_steps - two_channel_stft.shape[1]
+            two_channel_stft = np.pad(two_channel_stft, ((0, 0), (0, pad_width), (0, 0)))
+        else:
+            two_channel_stft = two_channel_stft[:, :time_steps, :]
+        
+        pn0 = mat_contents['pn0_all'][0, 0].flatten()
+        pn1 = mat_contents['pn1_all'][0, 0].flatten()
+        
+        pn0 = np.pad(pn0, (0, PN_CODE_LENGTH - len(pn0))) if len(pn0) < PN_CODE_LENGTH else pn0[:PN_CODE_LENGTH]
+        pn1 = np.pad(pn1, (0, PN_CODE_LENGTH - len(pn1))) if len(pn1) < PN_CODE_LENGTH else pn1[:PN_CODE_LENGTH]
+        
+        input_stft = np.expand_dims(two_channel_stft, axis=0)
+        input_pn0 = np.expand_dims(pn0, axis=0)
+        input_pn1 = np.expand_dims(pn1, axis=0)
+        
+        # --- PREPARE INPUT FOR ATTACK CLASSIFIER (Model 2) ---
+        # Ensure block is within bounds for both audios
+        if end > len(y_watermarked) or end > len(y_original):
+            continue
+
+        audio_block_original = y_original[start:end]
+        
+        mfcc_signal = _process_mfcc_for_model(audio_block_w, sr, N_MFCC_ATTACK, MAX_PAD_LEN_ATTACK)
+        mfcc_baseline = _process_mfcc_for_model(audio_block_original, sr, N_MFCC_ATTACK, MAX_PAD_LEN_ATTACK)
+        
+        # Create the single MFCC difference tensor
+        mfcc_diff = mfcc_signal - mfcc_baseline
+        
+        # Reshape for the CNN: (batch, height, width, channels)
+        input_mfcc_diff = np.expand_dims(mfcc_diff, axis=0)
+        input_mfcc_diff = np.expand_dims(input_mfcc_diff, axis=-1)
+
+        # --- RUN PREDICTIONS ---
+        predicted_watermark_output, _ = DL_MODEL.predict([input_stft, input_pn0, input_pn1], verbose=0)
+        predicted_attack_probs = ATTACK_CLASSIFIER_MODEL.predict(input_mfcc_diff, verbose=0)
+        
+        # --- PROCESS RESULTS ---
+        predicted_image = predicted_watermark_output[0].squeeze()
+        predicted_binary_flat = (predicted_image.flatten() > 0.5).astype(int)
+        
+        ber = np.not_equal(predicted_binary_flat, true_watermark_flat).sum() / true_watermark_flat.size
+        
+        if ber < best_ber:
+            best_ber = ber
+            raw_image = (predicted_binary_flat.reshape(WATERMARK_OUTPUT_DIMS) * 255).astype(np.uint8)
+            rotated_image = np.rot90(raw_image, k=-1)
+            corrected_image = np.fliplr(rotated_image)
+            best_predicted_image = corrected_image
+            
+            pred_attack_id = np.argmax(predicted_attack_probs[0])
+            best_predicted_attack = DL_ATTACK_ID_TO_NAME.get(pred_attack_id, "Unknown Attack")
+            best_block_num = block_num
+
+    if best_predicted_image is None:
+        raise ValueError("Could not process any audio blocks to generate a watermark image.")
+
+    print(f"🏆 Selected Block {best_block_num} as the best result with BER: {best_ber:.4f}")
+    
+    output_img_filename = os.path.basename(watermarked_audio_path).replace(".wav", "_extracted_dl.png")
+    output_img_path = os.path.join(output_dir, output_img_filename)
+    
+    plt.imsave(output_img_path, best_predicted_image, cmap='gray')
+    
+    return output_img_path, best_ber, best_predicted_attack
+
+
+def _process_mfcc_for_model(audio_block, sr, n_mfcc, max_pad_len):
+    """Processes an audio block into a padded MFCC matrix for the model."""
+    if audio_block.size == 0:
+        return np.zeros((n_mfcc, max_pad_len))
+    
+    mfccs = librosa.feature.mfcc(y=audio_block, sr=sr, n_mfcc=n_mfcc, n_fft=2048, hop_length=512)
+    
+    if mfccs.shape[1] < max_pad_len:
+        pad_width = max_pad_len - mfccs.shape[1]
+        mfccs = np.pad(mfccs, pad_width=((0, 0), (0, pad_width)), mode='constant')
+    else:
+        mfccs = mfccs[:, :max_pad_len]
+        
+    return mfccs
